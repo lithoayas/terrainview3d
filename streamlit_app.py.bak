@@ -1,0 +1,382 @@
+# streamlit_app.py
+# -------------------------------------------------------------
+# Streamlit app: draw a polygon on a map → fetch DEM → render 3D terrain
+# -------------------------------------------------------------
+# Features
+# - Draw a polygon on an interactive map (Leaflet via st_folium)
+# - Auto-compute bounding box of polygon and download a DEM (OpenTopography API)
+# - Clip DEM to polygon, downsample, and display a 3D surface (Plotly)
+# - Save the clipped DEM as GeoTIFF for reuse
+#
+# Notes
+# - This uses OpenTopography's Global DEM API as an easy, free source.
+#   You can switch demtype to what covers your AOI best: e.g., "SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30" etc.
+# - For very large polygons, consider server-side caching and tiling.
+#
+# Requirements (pip install ...):
+#   streamlit folium streamlit-folium shapely requests rasterio numpy plotly geopandas pyproj
+#
+# Run: streamlit run streamlit_app.py
+
+import json
+import io
+import os
+import math
+import tempfile
+import requests
+import numpy as np
+import rasterio
+from rasterio.io import MemoryFile
+from rasterio.mask import mask
+from shapely.geometry import shape, Polygon, mapping
+from shapely.ops import transform as shp_transform
+from pyproj import Transformer
+import plotly.graph_objects as go
+
+import streamlit as st
+from streamlit_folium import st_folium
+import folium
+from folium.plugins import Draw
+
+# --- API key for OpenTopography ---
+# Prefer Streamlit secrets; fallback to environment variable
+import os as _os
+try:
+    import streamlit as _st
+    _API_KEY = _st.secrets.get("OPENTOPO_API_KEY")
+except Exception:
+    _API_KEY = None
+
+if not _API_KEY:
+    _API_KEY = _os.environ.get("OPENTOPO_API_KEY")
+
+# ---------------------------
+# UI: Title & Sidebar
+# ---------------------------
+st.set_page_config(page_title="3D Terrain Picker", layout="wide")
+st.title("🗺️ Draw a polygon → 3D terrain map")
+st.write("Draw a polygon over your Area of Interest (AOI). We'll fetch DEM and render a 3D surface.")
+
+with st.sidebar:
+    st.header("Settings")
+    demtype = st.selectbox(
+        "DEM Source (OpenTopography Global DEM API)",
+        ["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"],
+        index=0,
+        help="Choose a global DEM. SRTMGL1_E is usually good between ~60°N and ~56°S."
+    )
+    max_side_px = st.slider(
+        "Max grid size (downsample)", 100, 600, 300,
+        help="Controls the resolution of the rendered 3D surface."
+    )
+    export_geotiff = st.checkbox("Save clipped DEM as GeoTIFF", value=True)
+
+# ---------------------------
+# Map with drawing tools
+# ---------------------------
+# Focus app on Namibia by default
+DEFAULT_CENTER = [-22.56, 17.08]  # Windhoek approx
+DEFAULT_ZOOM = 6
+
+# Namibia bounding box (approx)
+NAMIBIA_BBOX = {
+    "south": -28.97,
+    "west": 11.73,
+    "north": -16.95,
+    "east": 25.26,
+}
+
+
+m = folium.Map(location=DEFAULT_CENTER, zoom_start=DEFAULT_ZOOM, tiles="CartoDB positron")
+# Show Namibia extent and fit to it
+folium.Rectangle(
+    bounds=[
+        [NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
+        [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]],
+    ],
+    color="#1f77b4",
+    fill=False,
+    weight=2,
+    dash_array="5,5",
+    tooltip="Namibia extent (approx)"
+).add_to(m)
+# Fit map to Namibia
+m.fit_bounds([
+    [NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
+    [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]],
+])
+Draw(
+    draw_options={
+        "polyline": False,
+        "rectangle": True,
+        "polygon": True,
+        "circle": False,
+        "circlemarker": False,
+        "marker": False,
+    },
+    edit_options={"edit": True, "remove": True}
+).add_to(m)
+
+st.write("**Step 1:** Draw a *polygon* or *rectangle* covering your AOI, then click **Process**.")
+map_data = st_folium(m, height=480, width=None, returned_objects=["last_active_drawing", "all_drawings"])
+
+polygon_geojson = None
+if map_data and map_data.get("last_active_drawing"):
+    feat = map_data["last_active_drawing"]
+    if feat and feat.get("geometry"):
+        if feat["geometry"]["type"] in ("Polygon", "MultiPolygon"):
+            polygon_geojson = feat["geometry"]
+
+# Leaflet returns coordinates as [lat, lng]; GeoJSON expects [lng, lat].
+# Convert coordinates to proper lon/lat order for shapely/rasterio to match the DEM.
+
+def _swap_latlng_coords(coords):
+    return [[c[1], c[0]] for c in coords]
+
+def leaflet_to_geojson_lonlat(geom_dict):
+    gtype = geom_dict.get("type")
+    if gtype == "Polygon":
+        rings = []
+        for ring in geom_dict["coordinates"]:
+            rings.append(_swap_latlng_coords(ring))
+        return {"type": "Polygon", "coordinates": rings}
+    elif gtype == "MultiPolygon":
+        polys = []
+        for poly in geom_dict["coordinates"]:
+            rings = []
+            for ring in poly:
+                rings.append(_swap_latlng_coords(ring))
+            polys.append(rings)
+        return {"type": "MultiPolygon", "coordinates": polys}
+    else:
+        return geom_dict
+
+process = st.button("🚀 Process AOI → Fetch DEM → 3D Render")
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+
+def normalize_lon(lon: float) -> float:
+    """Wrap any longitude to [-180, 180]."""
+    lon = ((lon + 180.0) % 360.0) - 180.0
+    return -180.0 if abs(lon + 180.0) < 1e-9 else lon
+
+
+def poly_bbox(poly: Polygon):
+    minx, miny, maxx, maxy = poly.bounds
+    return miny, minx, maxy, maxx  # south, west, north, east
+
+
+def lonlat_to_utm_epsg(lon, lat):
+    zone = int((lon + 180) / 6) + 1
+    epsg = 32600 + zone if lat >= 0 else 32700 + zone
+    return epsg
+
+
+def clip_and_downsample(src_dataset, clip_geom, max_side=300):
+    # Clip raster to polygon
+    out_image, out_transform = mask(src_dataset, [mapping(clip_geom)], crop=True)
+    out_image = out_image[0]  # single band expected
+
+    # Replace nodata with nan
+    nodata = src_dataset.nodata
+    if nodata is not None:
+        out_image = np.where(out_image == nodata, np.nan, out_image)
+
+    h, w = out_image.shape
+    if h == 0 or w == 0:
+        raise ValueError("Empty output after clipping.")
+
+    # Downsample to max_side while preserving aspect
+    scale = max(h, w) / float(max_side)
+    if scale > 1.0:
+        new_h = max(2, int(round(h / scale)))
+        new_w = max(2, int(round(w / scale)))
+        # Simple stride-based downsample (fast). For quality, use skimage.transform.resize
+        out_image_ds = out_image[::int(math.ceil(h / new_h)), ::int(math.ceil(w / new_w))]
+    else:
+        out_image_ds = out_image
+        new_h, new_w = h, w
+
+    return out_image_ds
+
+
+# ---------------------------
+# Main processing
+# ---------------------------
+if process:
+    if not polygon_geojson:
+        st.error("Please draw a polygon or rectangle first.")
+        st.stop()
+
+    geom = shape(leaflet_to_geojson_lonlat(polygon_geojson))
+
+# Restrict to Namibia only: intersect user geometry with Namibia bbox
+namibia_poly = Polygon([
+    (NAMIBIA_BBOX["west"], NAMIBIA_BBOX["south"]),
+    (NAMIBIA_BBOX["east"], NAMIBIA_BBOX["south"]),
+    (NAMIBIA_BBOX["east"], NAMIBIA_BBOX["north"]),
+    (NAMIBIA_BBOX["west"], NAMIBIA_BBOX["north"]),
+])
+intersection_geom = geom.intersection(namibia_poly)
+if intersection_geom.is_empty:
+    st.error("Your AOI is outside Namibia. Please draw inside the Namibia rectangle.")
+    st.stop()
+# Use the intersection for all downstream steps
+geom = intersection_geom
+
+# If the intersection is a MultiPolygon (e.g., touches the Namibia bbox edge),
+# pick the largest piece so downstream bbox/clip behaves well.
+if geom.geom_type == "MultiPolygon":
+    geom = max(list(geom.geoms), key=lambda g: g.area)
+    if geom.geom_type == "MultiPolygon":
+        # Use largest part
+        geom = max(list(geom.geoms), key=lambda g: g.area)
+
+    # Compute BBOX in lon/lat for the Namibia-clipped geometry
+    south, west, north, east = poly_bbox(geom)
+
+    # Normalize to valid geographic ranges and handle dateline wrap
+    west  = normalize_lon(west)
+    east  = normalize_lon(east)
+    south = max(-90.0, min(90.0, south))
+    north = max(-90.0, min(90.0, north))
+
+    # Ensure correct ordering (north > south, east > west)
+    if north < south:
+        south, north = north, south
+    if east < west:
+        west, east = east, west
+
+    # Guard against zero-area boxes (API returns 400 if height/width is ~0)
+    MIN_DEG = 0.005  # ~500 m at equator
+    if (north - south) < MIN_DEG:
+        c = 0.5 * (north + south)
+        south = max(-90.0, c - MIN_DEG/2)
+        north = min(90.0,  c + MIN_DEG/2)
+    if (east - west) < MIN_DEG:
+        c = 0.5 * (east + west)
+        west = normalize_lon(c - MIN_DEG/2)
+        east = normalize_lon(c + MIN_DEG/2)
+
+    # Final safety for dateline after padding
+    if west > east:
+        west, east = east, west
+
+    st.info(f"AOI bounds: south={south:.5f}, west={west:.5f}, north={north:.5f}, east={east:.5f}")
+
+    # Call OpenTopography Global DEM API
+    # Docs: https://portal.opentopography.org/apidocs/#/Public/getGlobalDem
+    # Require API key
+    if not _API_KEY:
+        st.error("Missing OpenTopography API key. Add OPENTOPO_API_KEY to Streamlit secrets or environment.")
+        st.stop()
+
+    url = (
+        "https://portal.opentopography.org/API/globaldem"
+        f"?demtype={demtype}&south={south}&north={north}&west={west}&east={east}"
+        f"&outputFormat=GTiff&API_Key={_API_KEY}"
+    )
+
+    with st.status("Downloading DEM from OpenTopography…", expanded=False):
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        # Validate that we actually got a GeoTIFF, not an HTML/JSON error page
+        dem_bytes = r.content
+        if len(dem_bytes) < 16:
+            st.error("DEM download returned empty/short content.")
+            st.stop()
+        # GeoTIFF magic headers: 'II* ' or 'MM *'
+        magic = dem_bytes[:4]
+        ctype = r.headers.get("Content-Type", "")
+        if not (magic in (b"II* ", b"MM *") or ctype.lower().startswith("image/tiff") or ctype.lower().startswith("application/octet-stream")):
+            # Try to show the first 400 chars for debugging
+            try:
+                preview = r.content[:400].decode("utf-8", errors="ignore")
+            except Exception:
+                preview = str(r.content[:100])
+            st.error("OpenTopography did not return a GeoTIFF. Check API key, AOI size, and DEM availability.")
+            st.code(preview)
+            st.stop()
+
+    # Open in-memory GeoTIFF
+    with MemoryFile(dem_bytes) as memfile:
+        # Explicitly set driver to avoid 'driver is required' errors
+        with memfile.open(driver='GTiff') as src:
+            # Quick sanity: confirm AOI intersects raster bounds
+            src_bounds = src.bounds  # (left, bottom, right, top) in lon/lat
+            raster_poly = Polygon([
+                (src_bounds.left, src_bounds.bottom),
+                (src_bounds.right, src_bounds.bottom),
+                (src_bounds.right, src_bounds.top),
+                (src_bounds.left, src_bounds.top)
+            ])
+            if not geom.intersects(raster_poly):
+                st.error("Your drawn polygon does not overlap the downloaded DEM tile. Try a smaller AOI, switch DEM source, or redraw the polygon.")
+                st.info(f"DEM bounds lon/lat: left={src_bounds.left:.5f}, right={src_bounds.right:.5f}, bottom={src_bounds.bottom:.5f}, top={src_bounds.top:.5f}")
+                st.stop()
+
+            # Clip to exact polygon and downsample
+            try:
+                dem = clip_and_downsample(src, geom, max_side=max_side_px)
+            except Exception as e:
+                st.error(f"Clipping/downsampling failed: {e}")
+                st.stop()
+            # Build axes in meters using UTM for better aspect in 3D
+            # Transform raster bounds to UTM to compute X/Y axes
+            bounds = src.bounds
+            center_lon = (bounds.left + bounds.right) / 2
+            center_lat = (bounds.top + bounds.bottom) / 2
+            utm_epsg = lonlat_to_utm_epsg(center_lon, center_lat)
+            to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{utm_epsg}", always_xy=True).transform
+
+            # Make grid coords in lon/lat for the clipped region
+            # Recompute bounds from clipped window size
+            # Note: For simplicity we derive new affine after mask crop using out_transform
+            #       but we downsampled via striding; so we create linspaces instead.
+            h, w = dem.shape
+            lon_lin = np.linspace(west, east, w)
+            lat_lin = np.linspace(north, south, h)  # north→south so origin matches array
+            lon_grid, lat_grid = np.meshgrid(lon_lin, lat_lin)
+
+            # Project to UTM meters for better 3D aspect
+            x_grid, y_grid = to_utm(lon_grid, lat_grid)
+
+            # 3D Surface with Plotly
+            st.subheader("🌄 3D Terrain")
+            fig = go.Figure(
+                data=[go.Surface(x=x_grid, y=y_grid, z=dem, showscale=True, coloraxis=None)],
+            )
+            fig.update_scenes(xaxis_title_text="X (m)", yaxis_title_text="Y (m)", zaxis_title_text="Elevation (m)")
+            fig.update_layout(
+                height=700,
+                scene_aspectmode="data",
+                margin=dict(l=0, r=0, b=0, t=30),
+                title=f"{demtype} — 3D surface"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Optionally save GeoTIFF
+            if export_geotiff:
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as tmp:
+                        out_path = tmp.name
+                    profile = src.profile.copy()
+                    profile.update({
+                        "driver": "GTiff",
+                        "height": dem.shape[0],
+                        "width": dem.shape[1],
+                        "count": 1,
+                        "dtype": "float32",
+                        "crs": "EPSG:4326",
+                        "transform": rasterio.transform.from_bounds(west, south, east, north, dem.shape[1], dem.shape[0])
+                    })
+                    with rasterio.open(out_path, "w", **profile) as dst:
+                        dst.write(dem.astype("float32"), 1)
+                    st.success(f"Saved clipped DEM: {out_path}")
+                    st.download_button("⬇️ Download DEM GeoTIFF", data=open(out_path, "rb").read(), file_name="clipped_dem.tif")
+                except Exception as e:
+                    st.warning(f"Could not save GeoTIFF: {e}")
+
+st.caption("Tip: For globe-scale 3D and photorealistic streaming terrain, consider a JS frontend with CesiumJS + Cesium World Terrain. For in‑browser hillshades, MapLibre GL JS + deck.gl TerrainLayer with Terrain‑RGB tiles (e.g., MapTiler) works great.")
