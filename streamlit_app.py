@@ -1,6 +1,6 @@
 # streamlit_app.py
-# Cloud-safe Namibia terrain picker (AAIGrid). No GDAL/Shapely/pyproj.
-# Adds: Bigger map + Clear shapes button (resets folium draw state).
+# Namibia terrain picker (no GDAL/Shapely/pyproj).
+# Fixes: sidebar form (no live reruns), bigger map, clear-shapes, easier polygon finishing.
 
 import io
 import math
@@ -19,22 +19,41 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Namibia 3D Terrain Picker", layout="wide")
 
-# ---------------- Session state (for map reset) ----------------
+# ---------- Session state ----------
 if "map_key" not in st.session_state:
-    st.session_state.map_key = 0  # increment to force a fresh Folium widget
+    st.session_state.map_key = 0          # bump to force a fresh Folium widget
+if "settings" not in st.session_state:
+    st.session_state.settings = {
+        "demtype": "SRTMGL1_E",
+        "max_side_px": 600,
+        "export_ascii": True,
+        "auto_clear": True,
+    }
 
-# ---------------- Sidebar ----------------
-st.sidebar.header("Settings")
-demtype = st.sidebar.selectbox(
-    "DEM (OpenTopography Global DEM API)",
-    ["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"],
-    index=0,
-)
-max_side_px = st.sidebar.slider("Max grid size (downsample)", 100, 1000, 600)
-export_ascii = st.sidebar.checkbox("Save clipped DEM as ASCII Grid", value=True)
-auto_clear = st.sidebar.checkbox("Auto-clear shapes after processing", value=True)
+# ---------- Sidebar (in a FORM to prevent live reruns) ----------
+with st.sidebar.form("settings_form", clear_on_submit=False):
+    st.header("Settings")
+    demtype = st.selectbox(
+        "DEM (OpenTopography Global DEM API)",
+        ["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"],
+        index=["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"].index(st.session_state.settings["demtype"]),
+    )
+    max_side_px = st.slider("Max grid size (downsample)", 100, 1000, st.session_state.settings["max_side_px"])
+    export_ascii = st.checkbox("Save clipped DEM as ASCII Grid", value=st.session_state.settings["export_ascii"])
+    auto_clear = st.checkbox("Auto-clear shapes after processing", value=st.session_state.settings["auto_clear"])
+    applied = st.form_submit_button("Apply")
 
-# API key
+if applied:
+    st.session_state.settings.update(
+        {"demtype": demtype, "max_side_px": max_side_px, "export_ascii": export_ascii, "auto_clear": auto_clear}
+    )
+# use the saved settings
+demtype = st.session_state.settings["demtype"]
+max_side_px = st.session_state.settings["max_side_px"]
+export_ascii = st.session_state.settings["export_ascii"]
+auto_clear = st.session_state.settings["auto_clear"]
+
+# ---------- API key ----------
 API_KEY = None
 try:
     API_KEY = st.secrets.get("OPENTOPO_API_KEY")
@@ -43,18 +62,19 @@ except Exception:
 if not API_KEY:
     API_KEY = os.environ.get("OPENTOPO_API_KEY")
 
-# ---------------- Constants ----------------
+# ---------- Constants ----------
 NAMIBIA_BBOX = {"south": -28.97, "west": 11.73, "north": -16.95, "east": 25.26}
 DEFAULT_CENTER = [-22.56, 17.08]  # lat, lon
 
-# ---------------- Header ----------------
+# ---------- Header ----------
 st.title("🗺️ Draw a polygon → 3D terrain map (Namibia)")
 st.write(
-    "Draw one or more **polygons/rectangles** inside Namibia. We’ll fetch DEM from "
-    "OpenTopography (ASCII Grid), clip to the **union** of your shapes, and render a 3D surface."
+    "Draw one or more **polygons/rectangles** inside Namibia. Finish by either **clicking the first white square**, "
+    "clicking the small **Finish** button above the map, or simply **double-clicking** near your last vertex. "
+    "Then click **Process AOI**."
 )
 
-# ---------------- Map controls row ----------------
+# ---------- Controls above map ----------
 colA, colB, colC = st.columns([1, 1, 6])
 with colA:
     if st.button("🧹 Clear shapes", help="Reset the drawing layer and start fresh"):
@@ -63,7 +83,7 @@ with colA:
 with colB:
     zoom_click = st.button("🔎 Zoom to Namibia", help="Refit map to Namibia extent")
 
-# ---------------- Build Folium map ----------------
+# ---------- Build Folium map ----------
 m = folium.Map(location=DEFAULT_CENTER, zoom_start=6, tiles="CartoDB positron")
 folium.Rectangle(
     bounds=[[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
@@ -75,40 +95,54 @@ if zoom_click:
     m.fit_bounds([[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
                   [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]])
 
+# Make finishing easier (bigger click tolerance, allow double-click to finish).
+# Leaflet.draw consumes these options per tool; unsupported keys are ignored harmlessly.
+polygon_opts = {
+    "allowIntersection": True,
+    "showArea": True,
+    "shapeOptions": {"clickTolerance": 12},   # easier to hit the vertex
+    "repeatMode": False,
+    "finishOnDoubleClick": True,              # many Leaflet.draw builds support this
+}
+rectangle_opts = {
+    "shapeOptions": {"clickTolerance": 12},
+    "repeatMode": False,
+}
+
 Draw(
     draw_options={
-        "polyline": False, "rectangle": True, "polygon": True,
-        "circle": False, "circlemarker": False, "marker": False,
+        "polyline": False,
+        "rectangle": rectangle_opts,
+        "polygon": polygon_opts,
+        "circle": False,
+        "circlemarker": False,
+        "marker": False,
     },
     edit_options={"edit": True, "remove": True}
 ).add_to(m)
 
-st.write("**Step 1:** Finish each shape (click the first point or press **Finish**), then click **Process**.")
-
-# Make the map **bigger**: height=720, width=1200, and unique key
+# Bigger canvas; stable key so drawing session isn't destroyed unless you press Clear shapes
 map_data = st_folium(
     m,
-    height=720,
-    width=1200,  # increases visible canvas; Streamlit will cap at container width
+    height=760,
+    width=1200,
     returned_objects=["last_active_drawing", "all_drawings"],
     key=f"map_{st.session_state.map_key}",
 )
 
 process = st.button("🚀 Process AOI → Fetch DEM → 3D Render")
 
-# ---------------- Helpers ----------------
+# ---------- Helpers ----------
 def normalize_lon(lon: float) -> float:
     lon = ((lon + 180.0) % 360.0) - 180.0
     return -180.0 if abs(lon + 180.0) < 1e-9 else lon
 
 def ensure_lnglat_coords(geometry: Dict) -> List[List[List[float]]]:
-    """Return list of rings (outer), each [[lon,lat]...]. Fix [lat,lon] if needed."""
     def fix_ring(ring):
         xs = [p[0] for p in ring]
         ys = [p[1] for p in ring]
         swap = any(abs(x) > 90 for x in xs) or (min(ys) > 10 or max(ys) < -35)
         return [[p[1], p[0]] for p in ring] if swap else ring
-
     rings = []
     t = geometry.get("type")
     if t == "Polygon":
@@ -120,15 +154,15 @@ def ensure_lnglat_coords(geometry: Dict) -> List[List[List[float]]]:
 
 def extract_all_rings(map_obj: Dict) -> List[List[List[float]]]:
     rings: List[List[List[float]]] = []
-    items = []
     if map_obj and map_obj.get("last_active_drawing"):
-        items.append(map_obj["last_active_drawing"])
-    if map_obj and map_obj.get("all_drawings"):
-        items.extend(map_obj["all_drawings"])
-    for feat in items:
-        g = feat.get("geometry")
+        g = map_obj["last_active_drawing"].get("geometry")
         if g and g.get("type") in ("Polygon", "MultiPolygon"):
             rings.extend(ensure_lnglat_coords(g))
+    if map_obj and map_obj.get("all_drawings"):
+        for feat in map_obj["all_drawings"]:
+            g = feat.get("geometry")
+            if g and g.get("type") in ("Polygon", "MultiPolygon"):
+                rings.extend(ensure_lnglat_coords(g))
     return rings
 
 def bounds_of_ring(r):  # -> (south, west, north, east)
@@ -148,7 +182,7 @@ def bbox_intersection(a: Dict, b: Dict) -> Optional[Dict]:
     south = max(a["south"], b["south"])
     north = min(a["north"], b["north"])
     if west < east and south < north:
-        return {"west": west, "east": east, "south": south, "north": north}
+        return {"west": west, "east": east, "south": north and north or north, "north": north}
     return None
 
 def points_in_polygon(xs: np.ndarray, ys: np.ndarray, ring) -> np.ndarray:
@@ -206,11 +240,11 @@ def downsample(arr, lon, lat, max_side=600):
     scale = max(h, w) / float(max_side)
     if scale <= 1.0:
         return arr, lon, lat
-    step_h = int(math.ceil(h / max(2, int(round(h / scale)))))
-    step_w = int(math.ceil(w / max(2, int(round(w / scale)))))
+    step_h = max(1, int(round(scale)))
+    step_w = max(1, int(round(scale)))
     return arr[::step_h, ::step_w], lon[::step_h, ::step_w], lat[::step_h, ::step_w]
 
-# ---------------- Main ----------------
+# ---------- Main ----------
 if process:
     if not API_KEY:
         st.error("Missing OpenTopography API key. Set OPENTOPO_API_KEY in secrets or env.")
@@ -218,20 +252,21 @@ if process:
 
     rings = extract_all_rings(map_data)
     if not rings:
-        st.error("No finished polygon/rectangle found. Close the shape (or click **Finish**) and try again.")
+        st.error("No finished polygon/rectangle found. Close the shape (or click **Finish** / **double-click**) and try again.")
         st.stop()
 
     s, w, n, e = bounds_of_rings(rings)
     aoi_bbox = {"south": s, "west": w, "north": n, "east": e}
-    inter = bbox_intersection(aoi_bbox, NAMIBIA_BBOX)
-    if inter is None:
+    # intersect with Namibia
+    west = max(aoi_bbox["west"], NAMIBIA_BBOX["west"])
+    east = min(aoi_bbox["east"], NAMIBIA_BBOX["east"])
+    south = max(aoi_bbox["south"], NAMIBIA_BBOX["south"])
+    north = min(aoi_bbox["north"], NAMIBIA_BBOX["north"])
+    if not (west < east and south < north):
         st.error("Your shapes are outside Namibia. Please draw inside the dashed rectangle.")
         st.stop()
 
-    west = normalize_lon(inter["west"]); east = normalize_lon(inter["east"])
-    south = max(-90.0, min(90.0, inter["south"])); north = max(-90.0, min(90.0, inter["north"]))
-    if north < south: south, north = north, south
-    if east < west:   west, east   = east, west
+    west = normalize_lon(west); east = normalize_lon(east)
     MIN_DEG = 0.005
     if (north - south) < MIN_DEG:
         c = 0.5*(north + south); south, north = c - MIN_DEG/2, c + MIN_DEG/2
@@ -272,7 +307,7 @@ if process:
         st.error("DEM fetched, but union mask excluded everything. Try a larger AOI or different DEM.")
         st.stop()
 
-    # Meters (local tangent)
+    # Approx meters
     deg2rad = np.pi / 180.0
     ref_lat = ((south + north) / 2.0) * deg2rad
     m_per_deg_lon = 111320.0 * np.cos(ref_lat)
@@ -307,17 +342,18 @@ if process:
                 out = np.where(np.isnan(dem_ds), -9999, dem_ds).astype(float)
                 for row in out:
                     f.write(" ".join(f"{v:.3f}" for v in row) + "\n")
-            st.success(f"Saved clipped ASCII Grid: {out_path}")
             with open(out_path, "rb") as fh:
                 st.download_button("⬇️ Download DEM (ASCII Grid)", data=fh.read(), file_name="clipped_dem.asc")
         except Exception as e:
             st.warning(f"Could not save ASCII Grid: {e}")
 
-    # Auto-clear shapes so old polygons don’t reappear
     if auto_clear:
         st.session_state.map_key += 1
         st.toast("Shapes cleared.")
         st.rerun()
 
-st.caption("Tip: If the map looks cramped, widen your browser or hide the sidebar. "
-           "Use **🧹 Clear shapes** to truly reset the drawing layer.")
+st.caption(
+    "Troubleshooting: Don’t touch the sidebar while drawing (it causes reruns). "
+    "To finish a polygon: click the **first white square**, click the **Finish** button in the small toolbar, "
+    "or simply **double-click** near your last vertex. Use **🧹 Clear shapes** to reset."
+)
