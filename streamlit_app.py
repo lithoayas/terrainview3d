@@ -1,12 +1,15 @@
 # streamlit_app.py
 # Namibia terrain picker (no GDAL/Shapely/pyproj).
-# Fixes: sidebar form (no live reruns), bigger map, clear-shapes, easier polygon finishing.
+# Fixes:
+# - Disable Leaflet double-click zoom so dblclick reliably FINISHES polygons
+# - Wider/taller map canvas (use_container_width=True)
+# - Keep existing clear/auto-clear + DEM download and 3D surface
 
 import io
 import math
 import os
 import tempfile
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import plotly.graph_objects as go
@@ -16,6 +19,7 @@ import streamlit as st
 import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
+from branca.element import MacroElement, Template  # <-- new: to inject Leaflet JS
 
 st.set_page_config(page_title="Namibia 3D Terrain Picker", layout="wide")
 
@@ -85,27 +89,39 @@ with colB:
 
 # ---------- Build Folium map ----------
 m = folium.Map(location=DEFAULT_CENTER, zoom_start=6, tiles="CartoDB positron")
+
+# Show Namibia extent
 folium.Rectangle(
     bounds=[[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
             [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]],
     color="#1f77b4", weight=2, dash_array="6,6", fill=False,
     tooltip="Namibia extent (approx)",
 ).add_to(m)
+
 if zoom_click:
     m.fit_bounds([[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
                   [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]])
 
-# Make finishing easier (bigger click tolerance, allow double-click to finish).
-# Leaflet.draw consumes these options per tool; unsupported keys are ignored harmlessly.
+# ---- NEW: disable double-click zoom so dblclick finishes polygon reliably
+_disable_dbl_tpl = Template("""
+{% macro script(this, kwargs) %}
+    {{this._parent.get_name()}}.doubleClickZoom.disable();
+{% endmacro %}
+""")
+_disable_dbl = MacroElement()
+_disable_dbl._template = _disable_dbl_tpl
+m.get_root().add_child(_disable_dbl)
+
+# Make finishing easier (click first vertex; dblclick to finish)
 polygon_opts = {
     "allowIntersection": True,
     "showArea": True,
-    "shapeOptions": {"clickTolerance": 12},   # easier to hit the vertex
+    "shapeOptions": {"weight": 2},
     "repeatMode": False,
-    "finishOnDoubleClick": True,              # many Leaflet.draw builds support this
+    "finishOnDoubleClick": True,   # effective now that dblclick zoom is disabled
 }
 rectangle_opts = {
-    "shapeOptions": {"clickTolerance": 12},
+    "shapeOptions": {"weight": 2},
     "repeatMode": False,
 }
 
@@ -124,8 +140,8 @@ Draw(
 # Bigger canvas; stable key so drawing session isn't destroyed unless you press Clear shapes
 map_data = st_folium(
     m,
-    height=760,
-    width=1200,
+    height=820,
+    use_container_width=True,     # fill layout width
     returned_objects=["last_active_drawing", "all_drawings"],
     key=f"map_{st.session_state.map_key}",
 )
@@ -138,12 +154,13 @@ def normalize_lon(lon: float) -> float:
     return -180.0 if abs(lon + 180.0) < 1e-9 else lon
 
 def ensure_lnglat_coords(geometry: Dict) -> List[List[List[float]]]:
+    """Ensure coordinates are [lon, lat]; tolerate [lat, lon] from some draw tools."""
     def fix_ring(ring):
         xs = [p[0] for p in ring]
         ys = [p[1] for p in ring]
         swap = any(abs(x) > 90 for x in xs) or (min(ys) > 10 or max(ys) < -35)
         return [[p[1], p[0]] for p in ring] if swap else ring
-    rings = []
+    rings: List[List[List[float]]] = []
     t = geometry.get("type")
     if t == "Polygon":
         rings.append(fix_ring(geometry["coordinates"][0]))
@@ -176,16 +193,8 @@ def bounds_of_rings(rings):
         s_list.append(s); w_list.append(w); n_list.append(n); e_list.append(e)
     return min(s_list), min(w_list), max(n_list), max(e_list)
 
-def bbox_intersection(a: Dict, b: Dict) -> Optional[Dict]:
-    west = max(a["west"], b["west"])
-    east = min(a["east"], b["east"])
-    south = max(a["south"], b["south"])
-    north = min(a["north"], b["north"])
-    if west < east and south < north:
-        return {"west": west, "east": east, "south": north and north or north, "north": north}
-    return None
-
 def points_in_polygon(xs: np.ndarray, ys: np.ndarray, ring) -> np.ndarray:
+    """Vectorized ray casting for one ring, xs/ys are 2D grids (lon/lat)."""
     X = xs.ravel(); Y = ys.ravel()
     inside = np.zeros_like(X, dtype=bool)
     poly = np.asarray(ring, dtype=float)
@@ -245,7 +254,7 @@ def downsample(arr, lon, lat, max_side=600):
     return arr[::step_h, ::step_w], lon[::step_h, ::step_w], lat[::step_h, ::step_w]
 
 # ---------- Main ----------
-if process:
+if st.button("🚀 Process AOI → Fetch DEM → 3D Render"):
     if not API_KEY:
         st.error("Missing OpenTopography API key. Set OPENTOPO_API_KEY in secrets or env.")
         st.stop()
@@ -307,7 +316,7 @@ if process:
         st.error("DEM fetched, but union mask excluded everything. Try a larger AOI or different DEM.")
         st.stop()
 
-    # Approx meters
+    # Approx meters for axes
     deg2rad = np.pi / 180.0
     ref_lat = ((south + north) / 2.0) * deg2rad
     m_per_deg_lon = 111320.0 * np.cos(ref_lat)
@@ -355,5 +364,5 @@ if process:
 st.caption(
     "Troubleshooting: Don’t touch the sidebar while drawing (it causes reruns). "
     "To finish a polygon: click the **first white square**, click the **Finish** button in the small toolbar, "
-    "or simply **double-click** near your last vertex. Use **🧹 Clear shapes** to reset."
+    "or simply **double-click** near your last vertex. Press **Enter** to finish as well."
 )
