@@ -1,5 +1,6 @@
 # streamlit_app.py
-# Cloud-safe Namibia terrain picker (AAIGrid) — no GDAL/Shapely/pyproj.
+# Cloud-safe Namibia terrain picker (AAIGrid). No GDAL/Shapely/pyproj.
+# Adds: Bigger map + Clear shapes button (resets folium draw state).
 
 import io
 import math
@@ -16,25 +17,24 @@ import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
-# --------------------------- UI ---------------------------
 st.set_page_config(page_title="Namibia 3D Terrain Picker", layout="wide")
-st.title("🗺️ Draw a polygon → 3D terrain map (Namibia)")
-st.write(
-    "Draw one or more **polygons/rectangles** inside Namibia. We’ll fetch DEM from "
-    "OpenTopography (ASCII Grid), clip to the **union** of your shapes, and render a 3D surface."
+
+# ---------------- Session state (for map reset) ----------------
+if "map_key" not in st.session_state:
+    st.session_state.map_key = 0  # increment to force a fresh Folium widget
+
+# ---------------- Sidebar ----------------
+st.sidebar.header("Settings")
+demtype = st.sidebar.selectbox(
+    "DEM (OpenTopography Global DEM API)",
+    ["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"],
+    index=0,
 )
+max_side_px = st.sidebar.slider("Max grid size (downsample)", 100, 1000, 600)
+export_ascii = st.sidebar.checkbox("Save clipped DEM as ASCII Grid", value=True)
+auto_clear = st.sidebar.checkbox("Auto-clear shapes after processing", value=True)
 
-with st.sidebar:
-    st.header("Settings")
-    demtype = st.selectbox(
-        "DEM (OpenTopography Global DEM API)",
-        ["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"],
-        index=0,
-    )
-    max_side_px = st.slider("Max grid size (downsample)", 100, 800, 350)
-    export_ascii = st.checkbox("Save clipped DEM as ASCII Grid", value=True)
-
-# OpenTopography API key (Streamlit secrets or env)
+# API key
 API_KEY = None
 try:
     API_KEY = st.secrets.get("OPENTOPO_API_KEY")
@@ -43,11 +43,27 @@ except Exception:
 if not API_KEY:
     API_KEY = os.environ.get("OPENTOPO_API_KEY")
 
-# Namibia bbox (lon/lat)
+# ---------------- Constants ----------------
 NAMIBIA_BBOX = {"south": -28.97, "west": 11.73, "north": -16.95, "east": 25.26}
 DEFAULT_CENTER = [-22.56, 17.08]  # lat, lon
 
-# Map
+# ---------------- Header ----------------
+st.title("🗺️ Draw a polygon → 3D terrain map (Namibia)")
+st.write(
+    "Draw one or more **polygons/rectangles** inside Namibia. We’ll fetch DEM from "
+    "OpenTopography (ASCII Grid), clip to the **union** of your shapes, and render a 3D surface."
+)
+
+# ---------------- Map controls row ----------------
+colA, colB, colC = st.columns([1, 1, 6])
+with colA:
+    if st.button("🧹 Clear shapes", help="Reset the drawing layer and start fresh"):
+        st.session_state.map_key += 1
+        st.rerun()
+with colB:
+    zoom_click = st.button("🔎 Zoom to Namibia", help="Refit map to Namibia extent")
+
+# ---------------- Build Folium map ----------------
 m = folium.Map(location=DEFAULT_CENTER, zoom_start=6, tiles="CartoDB positron")
 folium.Rectangle(
     bounds=[[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
@@ -55,8 +71,9 @@ folium.Rectangle(
     color="#1f77b4", weight=2, dash_array="6,6", fill=False,
     tooltip="Namibia extent (approx)",
 ).add_to(m)
-m.fit_bounds([[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
-              [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]])
+if zoom_click:
+    m.fit_bounds([[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
+                  [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]])
 
 Draw(
     draw_options={
@@ -67,27 +84,32 @@ Draw(
 ).add_to(m)
 
 st.write("**Step 1:** Finish each shape (click the first point or press **Finish**), then click **Process**.")
-map_data = st_folium(m, height=480, returned_objects=["last_active_drawing", "all_drawings"])
+
+# Make the map **bigger**: height=720, width=1200, and unique key
+map_data = st_folium(
+    m,
+    height=720,
+    width=1200,  # increases visible canvas; Streamlit will cap at container width
+    returned_objects=["last_active_drawing", "all_drawings"],
+    key=f"map_{st.session_state.map_key}",
+)
+
 process = st.button("🚀 Process AOI → Fetch DEM → 3D Render")
 
-# ------------------------ Helpers -------------------------
+# ---------------- Helpers ----------------
 def normalize_lon(lon: float) -> float:
     lon = ((lon + 180.0) % 360.0) - 180.0
     return -180.0 if abs(lon + 180.0) < 1e-9 else lon
 
 def ensure_lnglat_coords(geometry: Dict) -> List[List[List[float]]]:
-    """
-    Return a list of polygon rings (outer rings only), each as [[lon,lat],...].
-    Accepts Polygon or MultiPolygon; fixes [lat,lon] if needed.
-    """
+    """Return list of rings (outer), each [[lon,lat]...]. Fix [lat,lon] if needed."""
     def fix_ring(ring):
         xs = [p[0] for p in ring]
         ys = [p[1] for p in ring]
-        # If x looks like latitude or y far from S. Africa, swap.
         swap = any(abs(x) > 90 for x in xs) or (min(ys) > 10 or max(ys) < -35)
         return [[p[1], p[0]] for p in ring] if swap else ring
 
-    rings: List[List[List[float]]] = []
+    rings = []
     t = geometry.get("type")
     if t == "Polygon":
         rings.append(fix_ring(geometry["coordinates"][0]))
@@ -97,7 +119,6 @@ def ensure_lnglat_coords(geometry: Dict) -> List[List[List[float]]]:
     return rings
 
 def extract_all_rings(map_obj: Dict) -> List[List[List[float]]]:
-    """Collect rings from the latest drawing + all_drawings."""
     rings: List[List[List[float]]] = []
     items = []
     if map_obj and map_obj.get("last_active_drawing"):
@@ -110,12 +131,11 @@ def extract_all_rings(map_obj: Dict) -> List[List[List[float]]]:
             rings.extend(ensure_lnglat_coords(g))
     return rings
 
-def bounds_of_ring(r: List[List[float]]) -> Tuple[float, float, float, float]:
-    xs = [p[0] for p in r]
-    ys = [p[1] for p in r]
-    return min(ys), min(xs), max(ys), max(xs)  # south, west, north, east
+def bounds_of_ring(r):  # -> (south, west, north, east)
+    xs = [p[0] for p in r]; ys = [p[1] for p in r]
+    return min(ys), min(xs), max(ys), max(xs)
 
-def bounds_of_rings(rings: List[List[List[float]]]) -> Tuple[float, float, float, float]:
+def bounds_of_rings(rings):
     s_list, w_list, n_list, e_list = [], [], [], []
     for r in rings:
         s, w, n, e = bounds_of_ring(r)
@@ -131,19 +151,12 @@ def bbox_intersection(a: Dict, b: Dict) -> Optional[Dict]:
         return {"west": west, "east": east, "south": south, "north": north}
     return None
 
-def points_in_polygon(xs: np.ndarray, ys: np.ndarray, ring: List[List[float]]) -> np.ndarray:
-    """
-    Vectorized ray-casting point-in-polygon for one ring (no holes).
-    xs, ys same-shaped grids. Returns boolean mask.
-    """
-    X = xs.ravel()
-    Y = ys.ravel()
+def points_in_polygon(xs: np.ndarray, ys: np.ndarray, ring) -> np.ndarray:
+    X = xs.ravel(); Y = ys.ravel()
     inside = np.zeros_like(X, dtype=bool)
-
     poly = np.asarray(ring, dtype=float)
     px, py = poly[:, 0], poly[:, 1]
     n = len(poly)
-
     for i in range(n):
         j = (i - 1) % n
         xi, yi = px[i], py[i]
@@ -152,13 +165,9 @@ def points_in_polygon(xs: np.ndarray, ys: np.ndarray, ring: List[List[float]]) -
         x_int = (xj - xi) * (Y - yi) / (yj - yi + 1e-16) + xi
         cond &= (X < x_int)
         inside ^= cond
-
     return inside.reshape(xs.shape)
 
 def parse_aaigrid(text_bytes: bytes):
-    """
-    Parse ESRI ASCII Grid (AAIGrid) → (arr, ncols, nrows, west, south, east, north, cellsize).
-    """
     s = text_bytes.decode("utf-8", errors="ignore").strip().splitlines()
     header, data_start = {}, 0
     for i, line in enumerate(s[:12]):
@@ -173,18 +182,14 @@ def parse_aaigrid(text_bytes: bytes):
         else:
             data_start = i
             break
-
     ncols = int(header["ncols"]); nrows = int(header["nrows"])
     cellsize = float(header["cellsize"])
     nodata = float(header.get("nodata_value", -9999.0))
-
     west = float(header.get("xllcorner", header.get("xllcenter"))) - (0 if "xllcorner" in header else 0.5*cellsize)
     south = float(header.get("yllcorner", header.get("yllcenter"))) - (0 if "yllcorner" in header else 0.5*cellsize)
-
     data_str = s[data_start : data_start + nrows]
     arr = np.loadtxt(io.StringIO("\n".join(data_str)), dtype=float)
     arr = np.where(arr == nodata, np.nan, arr)
-
     north = south + nrows * cellsize
     east  = west  + ncols * cellsize
     return arr, ncols, nrows, west, south, east, north, cellsize
@@ -196,7 +201,7 @@ def make_lonlat_grids(west, south, east, north, ncols, nrows):
     lat_centers = np.linspace(north - 0.5 * cellsize_y, south + 0.5 * cellsize_y, nrows)
     return np.meshgrid(lon_centers, lat_centers)
 
-def downsample(arr: np.ndarray, lon: np.ndarray, lat: np.ndarray, max_side=350):
+def downsample(arr, lon, lat, max_side=600):
     h, w = arr.shape
     scale = max(h, w) / float(max_side)
     if scale <= 1.0:
@@ -205,7 +210,7 @@ def downsample(arr: np.ndarray, lon: np.ndarray, lat: np.ndarray, max_side=350):
     step_w = int(math.ceil(w / max(2, int(round(w / scale)))))
     return arr[::step_h, ::step_w], lon[::step_h, ::step_w], lat[::step_h, ::step_w]
 
-# ------------------------- Main ----------------------------
+# ---------------- Main ----------------
 if process:
     if not API_KEY:
         st.error("Missing OpenTopography API key. Set OPENTOPO_API_KEY in secrets or env.")
@@ -216,7 +221,6 @@ if process:
         st.error("No finished polygon/rectangle found. Close the shape (or click **Finish**) and try again.")
         st.stop()
 
-    # Bbox of all rings, intersect with Namibia (we only download what we need)
     s, w, n, e = bounds_of_rings(rings)
     aoi_bbox = {"south": s, "west": w, "north": n, "east": e}
     inter = bbox_intersection(aoi_bbox, NAMIBIA_BBOX)
@@ -224,7 +228,6 @@ if process:
         st.error("Your shapes are outside Namibia. Please draw inside the dashed rectangle.")
         st.stop()
 
-    # Sanity / min-size
     west = normalize_lon(inter["west"]); east = normalize_lon(inter["east"])
     south = max(-90.0, min(90.0, inter["south"])); north = max(-90.0, min(90.0, inter["north"]))
     if north < south: south, north = north, south
@@ -251,7 +254,6 @@ if process:
             st.error("Failed to fetch DEM from OpenTopography.")
             st.code(r.content[:400].decode("utf-8", errors="ignore") or str(r.status_code))
             st.stop()
-
         try:
             dem, ncols, nrows, g_west, g_south, g_east, g_north, cellsize = parse_aaigrid(r.content)
         except Exception as e:
@@ -259,20 +261,18 @@ if process:
             st.code(r.content[:400].decode("utf-8", errors="ignore"))
             st.stop()
 
-    # Build lon/lat grids, clip to union of all rings (cell-center test)
     lon_grid, lat_grid = make_lonlat_grids(g_west, g_south, g_east, g_north, ncols, nrows)
     union_mask = np.zeros_like(dem, dtype=bool)
     for ring in rings:
         union_mask |= points_in_polygon(lon_grid, lat_grid, ring)
     dem_masked = np.where(union_mask, dem, np.nan)
 
-    # Downsample for speed
     dem_ds, lon_ds, lat_ds = downsample(dem_masked, lon_grid, lat_grid, max_side=max_side_px)
     if np.all(np.isnan(dem_ds)):
         st.error("DEM fetched, but union mask excluded everything. Try a larger AOI or different DEM.")
         st.stop()
 
-    # Axes in meters (approx local tangent)
+    # Meters (local tangent)
     deg2rad = np.pi / 180.0
     ref_lat = ((south + north) / 2.0) * deg2rad
     m_per_deg_lon = 111320.0 * np.cos(ref_lat)
@@ -281,16 +281,14 @@ if process:
     X = (lon_ds - x0) * m_per_deg_lon
     Y = (lat_ds - y0) * m_per_deg_lat
 
-    # 3D surface
     st.subheader("🌄 3D Terrain")
     fig = go.Figure(data=[go.Surface(x=X, y=Y, z=dem_ds, showscale=True)])
     fig.update_scenes(xaxis_title_text="X (m)", yaxis_title_text="Y (m)", zaxis_title_text="Elevation (m)")
-    fig.update_layout(height=720, scene_aspectmode="data",
+    fig.update_layout(height=750, scene_aspectmode="data",
                       margin=dict(l=0, r=0, b=0, t=30),
                       title=f"{demtype} — 3D surface (union of shapes)")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Optional export of clipped DEM as ASCII grid (uses downsampled grid)
     if export_ascii:
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".asc") as tmp:
@@ -315,4 +313,11 @@ if process:
         except Exception as e:
             st.warning(f"Could not save ASCII Grid: {e}")
 
-st.caption("No native deps. If a shape won’t process, make sure you **closed** it (Finish/first point).")
+    # Auto-clear shapes so old polygons don’t reappear
+    if auto_clear:
+        st.session_state.map_key += 1
+        st.toast("Shapes cleared.")
+        st.rerun()
+
+st.caption("Tip: If the map looks cramped, widen your browser or hide the sidebar. "
+           "Use **🧹 Clear shapes** to truly reset the drawing layer.")
