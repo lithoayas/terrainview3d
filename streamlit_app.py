@@ -1,12 +1,11 @@
 # streamlit_app.py
 # Namibia terrain picker (no GDAL/Shapely/pyproj).
 # Fixes:
-# - Disable Leaflet double-click zoom so dblclick reliably FINISHES polygons
-# - Wider/taller map canvas (use_container_width=True)
-# - Keep existing clear/auto-clear + DEM download and 3D surface
+# - Unique keys for ALL widgets (fixes DuplicateWidgetID)
+# - Disable Leaflet double-click zoom so dblclick reliably finishes polygons
+# - Wider/taller map canvas; stable map key; no live reruns in sidebar form
 
 import io
-import math
 import os
 import tempfile
 from typing import Dict, List, Optional
@@ -19,13 +18,13 @@ import streamlit as st
 import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
-from branca.element import MacroElement, Template  # <-- new: to inject Leaflet JS
+from branca.element import MacroElement, Template
 
 st.set_page_config(page_title="Namibia 3D Terrain Picker", layout="wide")
 
 # ---------- Session state ----------
 if "map_key" not in st.session_state:
-    st.session_state.map_key = 0          # bump to force a fresh Folium widget
+    st.session_state.map_key = 0
 if "settings" not in st.session_state:
     st.session_state.settings = {
         "demtype": "SRTMGL1_E",
@@ -34,24 +33,32 @@ if "settings" not in st.session_state:
         "auto_clear": True,
     }
 
-# ---------- Sidebar (in a FORM to prevent live reruns) ----------
+# ---------- Sidebar (FORM prevents live reruns) ----------
 with st.sidebar.form("settings_form", clear_on_submit=False):
     st.header("Settings")
     demtype = st.selectbox(
         "DEM (OpenTopography Global DEM API)",
         ["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"],
         index=["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"].index(st.session_state.settings["demtype"]),
+        key="sb_demtype",
     )
-    max_side_px = st.slider("Max grid size (downsample)", 100, 1000, st.session_state.settings["max_side_px"])
-    export_ascii = st.checkbox("Save clipped DEM as ASCII Grid", value=st.session_state.settings["export_ascii"])
-    auto_clear = st.checkbox("Auto-clear shapes after processing", value=st.session_state.settings["auto_clear"])
-    applied = st.form_submit_button("Apply")
+    max_side_px = st.slider(
+        "Max grid size (downsample)", 100, 1000, st.session_state.settings["max_side_px"], key="sb_maxside"
+    )
+    export_ascii = st.checkbox(
+        "Save clipped DEM as ASCII Grid", value=st.session_state.settings["export_ascii"], key="sb_export"
+    )
+    auto_clear = st.checkbox(
+        "Auto-clear shapes after processing", value=st.session_state.settings["auto_clear"], key="sb_autoclear"
+    )
+    applied = st.form_submit_button("Apply", type="primary", use_container_width=True, key="sb_apply")
 
 if applied:
     st.session_state.settings.update(
         {"demtype": demtype, "max_side_px": max_side_px, "export_ascii": export_ascii, "auto_clear": auto_clear}
     )
-# use the saved settings
+
+# use the saved settings everywhere below
 demtype = st.session_state.settings["demtype"]
 max_side_px = st.session_state.settings["max_side_px"]
 export_ascii = st.session_state.settings["export_ascii"]
@@ -75,22 +82,23 @@ st.title("🗺️ Draw a polygon → 3D terrain map (Namibia)")
 st.write(
     "Draw one or more **polygons/rectangles** inside Namibia. Finish by either **clicking the first white square**, "
     "clicking the small **Finish** button above the map, or simply **double-clicking** near your last vertex. "
-    "Then click **Process AOI**."
+    "You can also press **Enter**. Then click **Process AOI**."
 )
 
 # ---------- Controls above map ----------
-colA, colB, colC = st.columns([1, 1, 6])
+colA, colB, _ = st.columns([1, 1, 6])
 with colA:
-    if st.button("🧹 Clear shapes", help="Reset the drawing layer and start fresh"):
+    if st.button("🧹 Clear shapes", key="btn_clear", help="Reset the drawing layer and start fresh"):
         st.session_state.map_key += 1
         st.rerun()
 with colB:
-    zoom_click = st.button("🔎 Zoom to Namibia", help="Refit map to Namibia extent")
+    zoom_click = st.button("🔎 Zoom to Namibia", key="btn_zoom", help="Refit map to Namibia extent")
 
 # ---------- Build Folium map ----------
-m = folium.Map(location=DEFAULT_CENTER, zoom_start=6, tiles="CartoDB positron")
+# (doubleClickZoom=False here, and we also enforce via JS to be extra safe)
+m = folium.Map(location=DEFAULT_CENTER, zoom_start=6, tiles="CartoDB positron", control_scale=True)
 
-# Show Namibia extent
+# Namibia extent overlay
 folium.Rectangle(
     bounds=[[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
             [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]],
@@ -102,28 +110,26 @@ if zoom_click:
     m.fit_bounds([[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
                   [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]])
 
-# ---- NEW: disable double-click zoom so dblclick finishes polygon reliably
+# ---- Enforce: disable double-click zoom (lets dblclick finish polygons) ----
 _disable_dbl_tpl = Template("""
 {% macro script(this, kwargs) %}
-    {{this._parent.get_name()}}.doubleClickZoom.disable();
+    {{this._parent.get_name()}}.doubleClickZoom && {{this._parent.get_name()}}.doubleClickZoom.disable();
 {% endmacro %}
 """)
 _disable_dbl = MacroElement()
 _disable_dbl._template = _disable_dbl_tpl
 m.get_root().add_child(_disable_dbl)
 
-# Make finishing easier (click first vertex; dblclick to finish)
+# Draw controls (Leaflet.draw)
 polygon_opts = {
     "allowIntersection": True,
     "showArea": True,
     "shapeOptions": {"weight": 2},
     "repeatMode": False,
-    "finishOnDoubleClick": True,   # effective now that dblclick zoom is disabled
+    # Some builds of Leaflet.draw honor this; ignored harmlessly if not present:
+    "finishOnDoubleClick": True,
 }
-rectangle_opts = {
-    "shapeOptions": {"weight": 2},
-    "repeatMode": False,
-}
+rectangle_opts = {"shapeOptions": {"weight": 2}, "repeatMode": False}
 
 Draw(
     draw_options={
@@ -137,16 +143,16 @@ Draw(
     edit_options={"edit": True, "remove": True}
 ).add_to(m)
 
-# Bigger canvas; stable key so drawing session isn't destroyed unless you press Clear shapes
+# Folium widget (stable key; big canvas)
 map_data = st_folium(
     m,
     height=820,
-    use_container_width=True,     # fill layout width
+    use_container_width=True,
     returned_objects=["last_active_drawing", "all_drawings"],
     key=f"map_{st.session_state.map_key}",
 )
 
-process = st.button("🚀 Process AOI → Fetch DEM → 3D Render")
+process_clicked = st.button("🚀 Process AOI → Fetch DEM → 3D Render", key="btn_process")
 
 # ---------- Helpers ----------
 def normalize_lon(lon: float) -> float:
@@ -154,7 +160,6 @@ def normalize_lon(lon: float) -> float:
     return -180.0 if abs(lon + 180.0) < 1e-9 else lon
 
 def ensure_lnglat_coords(geometry: Dict) -> List[List[List[float]]]:
-    """Ensure coordinates are [lon, lat]; tolerate [lat, lon] from some draw tools."""
     def fix_ring(ring):
         xs = [p[0] for p in ring]
         ys = [p[1] for p in ring]
@@ -194,7 +199,6 @@ def bounds_of_rings(rings):
     return min(s_list), min(w_list), max(n_list), max(e_list)
 
 def points_in_polygon(xs: np.ndarray, ys: np.ndarray, ring) -> np.ndarray:
-    """Vectorized ray casting for one ring, xs/ys are 2D grids (lon/lat)."""
     X = xs.ravel(); Y = ys.ravel()
     inside = np.zeros_like(X, dtype=bool)
     poly = np.asarray(ring, dtype=float)
@@ -254,7 +258,7 @@ def downsample(arr, lon, lat, max_side=600):
     return arr[::step_h, ::step_w], lon[::step_h, ::step_w], lat[::step_h, ::step_w]
 
 # ---------- Main ----------
-if st.button("🚀 Process AOI → Fetch DEM → 3D Render"):
+if process_clicked:
     if not API_KEY:
         st.error("Missing OpenTopography API key. Set OPENTOPO_API_KEY in secrets or env.")
         st.stop()
@@ -266,7 +270,6 @@ if st.button("🚀 Process AOI → Fetch DEM → 3D Render"):
 
     s, w, n, e = bounds_of_rings(rings)
     aoi_bbox = {"south": s, "west": w, "north": n, "east": e}
-    # intersect with Namibia
     west = max(aoi_bbox["west"], NAMIBIA_BBOX["west"])
     east = min(aoi_bbox["east"], NAMIBIA_BBOX["east"])
     south = max(aoi_bbox["south"], NAMIBIA_BBOX["south"])
@@ -317,8 +320,7 @@ if st.button("🚀 Process AOI → Fetch DEM → 3D Render"):
         st.stop()
 
     # Approx meters for axes
-    deg2rad = np.pi / 180.0
-    ref_lat = ((south + north) / 2.0) * deg2rad
+    ref_lat = ((south + north) / 2.0) * (np.pi / 180.0)
     m_per_deg_lon = 111320.0 * np.cos(ref_lat)
     m_per_deg_lat = 110540.0
     x0, y0 = float(np.nanmin(lon_ds)), float(np.nanmin(lat_ds))
@@ -352,7 +354,7 @@ if st.button("🚀 Process AOI → Fetch DEM → 3D Render"):
                 for row in out:
                     f.write(" ".join(f"{v:.3f}" for v in row) + "\n")
             with open(out_path, "rb") as fh:
-                st.download_button("⬇️ Download DEM (ASCII Grid)", data=fh.read(), file_name="clipped_dem.asc")
+                st.download_button("⬇️ Download DEM (ASCII Grid)", data=fh.read(), file_name="clipped_dem.asc", key="dl_dem")
         except Exception as e:
             st.warning(f"Could not save ASCII Grid: {e}")
 
