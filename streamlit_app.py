@@ -1,6 +1,7 @@
 # streamlit_app.py
 # Namibia terrain picker (no GDAL/Shapely/pyproj).
-# Stable keys (no DuplicateWidgetID) + dblclick finish for polygons.
+# Adds: keyboard finish (Enter/F), manual AOI inputs (rectangle or polygon),
+# and persists the 3D view across reruns.
 
 import io
 import os
@@ -20,47 +21,89 @@ from branca.element import MacroElement, Template
 st.set_page_config(page_title="Namibia 3D Terrain Picker", layout="wide")
 
 # ---------- Session state ----------
-if "map_key" not in st.session_state:
-    st.session_state.map_key = 0
-if "settings" not in st.session_state:
-    st.session_state.settings = {
+ss = st.session_state
+if "map_key" not in ss:
+    ss.map_key = 0
+if "settings" not in ss:
+    ss.settings = {
         "demtype": "SRTMGL1_E",
         "max_side_px": 600,
         "export_ascii": True,
         "auto_clear": True,
     }
+if "manual_rings" not in ss:
+    ss.manual_rings: List[List[List[float]]] = []  # list of rings [[ [lon,lat], ... ]]
+if "last_fig" not in ss:
+    ss.last_fig = None
 
-# ---------- Sidebar (FORM prevents live reruns) ----------
+# ---------- Sidebar: Settings (FORM stops live reruns) ----------
 with st.sidebar.form("settings_form", clear_on_submit=False):
     st.header("Settings")
     demtype = st.selectbox(
         "DEM (OpenTopography Global DEM API)",
         ["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"],
-        index=["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"].index(st.session_state.settings["demtype"]),
+        index=["SRTMGL1_E", "SRTMGL3", "NASADEM", "AW3D30"].index(ss.settings["demtype"]),
         key="sb_demtype",
     )
-    max_side_px = st.slider(
-        "Max grid size (downsample)", 100, 1000, st.session_state.settings["max_side_px"], key="sb_maxside"
-    )
-    export_ascii = st.checkbox(
-        "Save clipped DEM as ASCII Grid", value=st.session_state.settings["export_ascii"], key="sb_export"
-    )
-    auto_clear = st.checkbox(
-        "Auto-clear shapes after processing", value=st.session_state.settings["auto_clear"], key="sb_autoclear"
-    )
-    # NOTE: older Streamlit versions don't allow key/type/use_container_width here
+    max_side_px = st.slider("Max grid size (downsample)", 100, 1000, ss.settings["max_side_px"], key="sb_maxside")
+    export_ascii = st.checkbox("Save clipped DEM as ASCII Grid", value=ss.settings["export_ascii"], key="sb_export")
+    auto_clear = st.checkbox("Auto-clear shapes after processing", value=ss.settings["auto_clear"], key="sb_autoclear")
     applied = st.form_submit_button("Apply")
 
 if applied:
-    st.session_state.settings.update(
+    ss.settings.update(
         {"demtype": demtype, "max_side_px": max_side_px, "export_ascii": export_ascii, "auto_clear": auto_clear}
     )
 
-# use the saved settings
-demtype = st.session_state.settings["demtype"]
-max_side_px = st.session_state.settings["max_side_px"]
-export_ascii = st.session_state.settings["export_ascii"]
-auto_clear = st.session_state.settings["auto_clear"]
+# Use the saved settings
+demtype = ss.settings["demtype"]
+max_side_px = ss.settings["max_side_px"]
+export_ascii = ss.settings["export_ascii"]
+auto_clear = ss.settings["auto_clear"]
+
+# ---------- Sidebar: Manual AOI entry (RECTANGLE or POLYGON) ----------
+with st.sidebar.expander("Manual AOI (no clicking)", expanded=False):
+    st.markdown("**Rectangle (South/West/North/East)**")
+    c1, c2 = st.columns(2)
+    with c1:
+        man_s = st.number_input("South (lat)", value=-23.0, step=0.01, key="man_s")
+        man_w = st.number_input("West (lon)", value=16.5, step=0.01, key="man_w")
+    with c2:
+        man_n = st.number_input("North (lat)", value=-22.5, step=0.01, key="man_n")
+        man_e = st.number_input("East (lon)", value=17.2, step=0.01, key="man_e")
+    add_rect = st.button("➕ Add rectangle AOI", key="btn_add_rect", help="Adds as a ring to the current session")
+
+    st.markdown("**Polygon (one `lat,lon` per line)**")
+    poly_text = st.text_area(
+        "Example:\n-22.90, 17.00\n-22.70, 17.10\n-22.80, 17.25",
+        key="poly_text",
+        height=120,
+    )
+    add_poly = st.button("➕ Add polygon AOI", key="btn_add_poly", help="Adds as a ring to the current session")
+
+    if add_rect:
+        # make a closed ring [lon,lat]
+        ring = [[man_w, man_s], [man_e, man_s], [man_e, man_n], [man_w, man_n], [man_w, man_s]]
+        ss.manual_rings.append(ring)
+        st.success("Rectangle added.")
+    if add_poly:
+        try:
+            pts = []
+            for line in poly_text.strip().splitlines():
+                if not line.strip():
+                    continue
+                lat_str, lon_str = [p.strip() for p in line.split(",")]
+                lat = float(lat_str); lon = float(lon_str)
+                pts.append([lon, lat])  # convert to [lon,lat]
+            if len(pts) >= 3:
+                if pts[0] != pts[-1]:
+                    pts.append(pts[0])
+                ss.manual_rings.append(pts)
+                st.success(f"Polygon with {len(pts)-1} vertices added.")
+            else:
+                st.warning("Need at least 3 points.")
+        except Exception as e:
+            st.error(f"Could not parse polygon: {e}")
 
 # ---------- API key ----------
 API_KEY = None
@@ -78,16 +121,16 @@ DEFAULT_CENTER = [-22.56, 17.08]  # lat, lon
 # ---------- Header ----------
 st.title("🗺️ Draw a polygon → 3D terrain map (Namibia)")
 st.write(
-    "Draw one or more **polygons/rectangles** inside Namibia. Finish by either **clicking the first white square**, "
-    "clicking the small **Finish** button above the map, or simply **double-clicking** near your last vertex. "
-    "You can also press **Enter**. Then click **Process AOI**."
+    "Finish drawing by **double-clicking**, **pressing Enter**, or pressing **F** (we capture the key). "
+    "Or skip clicking entirely and use **Manual AOI** in the sidebar."
 )
 
 # ---------- Controls above map ----------
 colA, colB, _ = st.columns([1, 1, 6])
 with colA:
     if st.button("🧹 Clear shapes", key="btn_clear", help="Reset the drawing layer and start fresh"):
-        st.session_state.map_key += 1
+        ss.map_key += 1
+        ss.manual_rings = []
         st.rerun()
 with colB:
     zoom_click = st.button("🔎 Zoom to Namibia", key="btn_zoom", help="Refit map to Namibia extent")
@@ -95,27 +138,49 @@ with colB:
 # ---------- Build Folium map ----------
 m = folium.Map(location=DEFAULT_CENTER, zoom_start=6, tiles="CartoDB positron", control_scale=True)
 
-# Namibia extent overlay
+# Namibia outline
 folium.Rectangle(
     bounds=[[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
             [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]],
-    color="#1f77b4", weight=2, dash_array="6,6", fill=False,
-    tooltip="Namibia extent (approx)",
+    color="#1f77b4", weight=2, dash_array="6,6", fill=False, tooltip="Namibia extent (approx)",
 ).add_to(m)
 
 if zoom_click:
     m.fit_bounds([[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
                   [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]])
 
-# ---- Disable double-click zoom so dblclick finishes polygon reliably ----
-_disable_dbl_tpl = Template("""
+# ---- Disable double-click zoom AND bind keyboard finish (Enter/F) ----
+finish_macro = Template("""
 {% macro script(this, kwargs) %}
-    {{this._parent.get_name()}}.doubleClickZoom && {{this._parent.get_name()}}.doubleClickZoom.disable();
+    var map = {{this._parent.get_name()}};
+    if (map.doubleClickZoom) { map.doubleClickZoom.disable(); }
+
+    function findDrawControl() {
+        if (!map._controls) return null;
+        for (var i=0; i<map._controls.length; i++) {
+            var c = map._controls[i];
+            if (typeof L !== 'undefined' && L.Control && L.Control.Draw && (c instanceof L.Control.Draw)) {
+                return c;
+            }
+        }
+        return null;
+    }
+    function finishIfDrawing() {
+        var dc = findDrawControl();
+        var handler = dc && dc._toolbars && dc._toolbars.draw && dc._toolbars.draw._activeMode && dc._toolbars.draw._activeMode.handler;
+        if (handler && handler._finishShape) { handler._finishShape(); return true; }
+        return false;
+    }
+    document.addEventListener('keydown', function(e){
+        var k = (e.key || '').toLowerCase();
+        if (k === 'enter' || k === 'f') {
+            if (finishIfDrawing()) { e.preventDefault(); }
+        }
+    });
 {% endmacro %}
 """)
-_disable_dbl = MacroElement()
-_disable_dbl._template = _disable_dbl_tpl
-m.get_root().add_child(_disable_dbl)
+macro = MacroElement(); macro._template = finish_macro
+m.get_root().add_child(macro)
 
 # Draw controls (Leaflet.draw)
 polygon_opts = {
@@ -123,8 +188,7 @@ polygon_opts = {
     "showArea": True,
     "shapeOptions": {"weight": 2},
     "repeatMode": False,
-    # Harmless if ignored by your Leaflet.draw build:
-    "finishOnDoubleClick": True,
+    "finishOnDoubleClick": True,   # harmless if ignored
 }
 rectangle_opts = {"shapeOptions": {"weight": 2}, "repeatMode": False}
 
@@ -140,13 +204,16 @@ Draw(
     edit_options={"edit": True, "remove": True}
 ).add_to(m)
 
-# Big canvas; stable key so drawing state persists unless you explicitly reset
+# Also render any MANUAL rings the user added
+for ring in ss.manual_rings:
+    folium.Polygon(locations=[[lat, lon] for (lon, lat) in ring],  # folium wants [lat, lon]
+                   color="#ff7f0e", weight=2, fill=True, fill_opacity=0.15,
+                   tooltip="Manual AOI").add_to(m)
+
+# Big canvas; stable key so drawing state persists unless reset
 map_data = st_folium(
-    m,
-    height=820,
-    use_container_width=True,
-    returned_objects=["last_active_drawing", "all_drawings"],
-    key=f"map_{st.session_state.map_key}",
+    m, height=820, use_container_width=True,
+    returned_objects=["last_active_drawing", "all_drawings"], key=f"map_{ss.map_key}",
 )
 
 process_clicked = st.button("🚀 Process AOI → Fetch DEM → 3D Render", key="btn_process")
@@ -173,6 +240,7 @@ def ensure_lnglat_coords(geometry: Dict) -> List[List[List[float]]]:
 
 def extract_all_rings(map_obj: Dict) -> List[List[List[float]]]:
     rings: List[List[List[float]]] = []
+    # from drawn geometry
     if map_obj and map_obj.get("last_active_drawing"):
         g = map_obj["last_active_drawing"].get("geometry")
         if g and g.get("type") in ("Polygon", "MultiPolygon"):
@@ -182,6 +250,8 @@ def extract_all_rings(map_obj: Dict) -> List[List[List[float]]]:
             g = feat.get("geometry")
             if g and g.get("type") in ("Polygon", "MultiPolygon"):
                 rings.extend(ensure_lnglat_coords(g))
+    # include manual rings (already [lon,lat])
+    rings.extend(ss.manual_rings)
     return rings
 
 def bounds_of_ring(r):  # -> (south, west, north, east)
@@ -262,15 +332,15 @@ if process_clicked:
 
     rings = extract_all_rings(map_data)
     if not rings:
-        st.error("No finished polygon/rectangle found. Close the shape (or click **Finish** / **double-click**) and try again.")
+        st.error("No AOI found. Use drawing tools or add a Manual AOI in the sidebar.")
         st.stop()
 
+    # Intersect union bbox with Namibia to keep API request valid
     s, w, n, e = bounds_of_rings(rings)
-    aoi_bbox = {"south": s, "west": w, "north": n, "east": e}
-    west = max(aoi_bbox["west"], NAMIBIA_BBOX["west"])
-    east = min(aoi_bbox["east"], NAMIBIA_BBOX["east"])
-    south = max(aoi_bbox["south"], NAMIBIA_BBOX["south"])
-    north = min(aoi_bbox["north"], NAMIBIA_BBOX["north"])
+    west = max(w, NAMIBIA_BBOX["west"])
+    east = min(e, NAMIBIA_BBOX["east"])
+    south = max(s, NAMIBIA_BBOX["south"])
+    north = min(n, NAMIBIA_BBOX["north"])
     if not (west < east and south < north):
         st.error("Your shapes are outside Namibia. Please draw inside the dashed rectangle.")
         st.stop()
@@ -305,6 +375,7 @@ if process_clicked:
             st.code(r.content[:400].decode("utf-8", errors="ignore"))
             st.stop()
 
+    # Build mask for union of all rings
     lon_grid, lat_grid = make_lonlat_grids(g_west, g_south, g_east, g_north, ncols, nrows)
     union_mask = np.zeros_like(dem, dtype=bool)
     for ring in rings:
@@ -331,6 +402,7 @@ if process_clicked:
                       margin=dict(l=0, r=0, b=0, t=30),
                       title=f"{demtype} — 3D surface (union of shapes)")
     st.plotly_chart(fig, use_container_width=True)
+    ss.last_fig = fig  # <-- persist plot so it survives future reruns
 
     if export_ascii:
         try:
@@ -355,13 +427,20 @@ if process_clicked:
         except Exception as e:
             st.warning(f"Could not save ASCII Grid: {e}")
 
+    # Optional auto-clear of map drawings AFTER plotting; figure stays via session_state
     if auto_clear:
-        st.session_state.map_key += 1
-        st.toast("Shapes cleared.")
-        st.rerun()
+        ss.map_key += 1
+        ss.manual_rings = []
+        st.toast("Shapes cleared (3D view kept).")
+        # no st.rerun() → keeps the plot visible
+
+# If a rerun happened (e.g., you adjusted the sidebar), show the last plot
+if ss.last_fig is not None and not process_clicked:
+    st.subheader("🌄 3D Terrain (last result)")
+    st.plotly_chart(ss.last_fig, use_container_width=True)
 
 st.caption(
-    "Troubleshooting: Don’t touch the sidebar while drawing (it causes reruns). "
-    "To finish a polygon: click the **first white square**, click the **Finish** button in the small toolbar, "
-    "or simply **double-click** near your last vertex. Press **Enter** to finish as well."
+    "Finishing options: **double-click**, **Enter**, or **F**. "
+    "Or use the **Manual AOI** expander to type a rectangle or polygon (lat,lon per line). "
+    "We keep the last 3D plot visible even after reruns."
 )
