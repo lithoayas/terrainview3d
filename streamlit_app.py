@@ -1,9 +1,6 @@
 # streamlit_app.py
 # Namibia terrain picker (no GDAL/Shapely/pyproj).
-# Fixes:
-# - Unique keys for ALL widgets (fixes DuplicateWidgetID)
-# - Disable Leaflet double-click zoom so dblclick reliably finishes polygons
-# - Wider/taller map canvas; stable map key; no live reruns in sidebar form
+# Stable keys (no DuplicateWidgetID) + dblclick finish for polygons.
 
 import io
 import os
@@ -51,14 +48,15 @@ with st.sidebar.form("settings_form", clear_on_submit=False):
     auto_clear = st.checkbox(
         "Auto-clear shapes after processing", value=st.session_state.settings["auto_clear"], key="sb_autoclear"
     )
-    applied = st.form_submit_button("Apply", type="primary", use_container_width=True, key="sb_apply")
+    # NOTE: older Streamlit versions don't allow key/type/use_container_width here
+    applied = st.form_submit_button("Apply")
 
 if applied:
     st.session_state.settings.update(
         {"demtype": demtype, "max_side_px": max_side_px, "export_ascii": export_ascii, "auto_clear": auto_clear}
     )
 
-# use the saved settings everywhere below
+# use the saved settings
 demtype = st.session_state.settings["demtype"]
 max_side_px = st.session_state.settings["max_side_px"]
 export_ascii = st.session_state.settings["export_ascii"]
@@ -95,7 +93,6 @@ with colB:
     zoom_click = st.button("🔎 Zoom to Namibia", key="btn_zoom", help="Refit map to Namibia extent")
 
 # ---------- Build Folium map ----------
-# (doubleClickZoom=False here, and we also enforce via JS to be extra safe)
 m = folium.Map(location=DEFAULT_CENTER, zoom_start=6, tiles="CartoDB positron", control_scale=True)
 
 # Namibia extent overlay
@@ -110,7 +107,7 @@ if zoom_click:
     m.fit_bounds([[NAMIBIA_BBOX["south"], NAMIBIA_BBOX["west"]],
                   [NAMIBIA_BBOX["north"], NAMIBIA_BBOX["east"]]])
 
-# ---- Enforce: disable double-click zoom (lets dblclick finish polygons) ----
+# ---- Disable double-click zoom so dblclick finishes polygon reliably ----
 _disable_dbl_tpl = Template("""
 {% macro script(this, kwargs) %}
     {{this._parent.get_name()}}.doubleClickZoom && {{this._parent.get_name()}}.doubleClickZoom.disable();
@@ -126,7 +123,7 @@ polygon_opts = {
     "showArea": True,
     "shapeOptions": {"weight": 2},
     "repeatMode": False,
-    # Some builds of Leaflet.draw honor this; ignored harmlessly if not present:
+    # Harmless if ignored by your Leaflet.draw build:
     "finishOnDoubleClick": True,
 }
 rectangle_opts = {"shapeOptions": {"weight": 2}, "repeatMode": False}
@@ -143,7 +140,7 @@ Draw(
     edit_options={"edit": True, "remove": True}
 ).add_to(m)
 
-# Folium widget (stable key; big canvas)
+# Big canvas; stable key so drawing state persists unless you explicitly reset
 map_data = st_folium(
     m,
     height=820,
